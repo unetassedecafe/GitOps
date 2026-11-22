@@ -62,7 +62,34 @@ spec:
           command:
             - sh
             - -c
-            - cp -a /opt/hermes/. /agent-src/
+            - |
+              cp -a /opt/hermes/. /agent-src/
+              # Repair two defects in the image that only bite once it is copied
+              # here, where the webui container discovers it:
+              #
+              # 1. .venv/bin/python symlinks to /usr/local/bin/python3. The venv
+              #    is built for 3.14.9 (pyvenv.cfg, cp314 wheels) but the webui
+              #    image is Debian trixie, whose python3 is 3.12. Under 3.12
+              #    pydantic_core fails to import ("undefined symbol:
+              #    PyDict_GetItemRef") and `hermes dashboard` dies before serving.
+              # 2. install-stamp.json bakes pmRuntime as /opt/hermes/pm-runtime,
+              #    the path inside the agent image. It does not exist in the
+              #    copy, so PM refuses every plugin install/update ("packaged PM
+              #    runtime is missing or invalid").
+              #
+              # This init container is the only writer of agent-src, so the fix
+              # is re-applied on every pod start. The bundled interpreter is used
+              # because the base image does not guarantee a python3 on PATH.
+              ln -sfn /agent-src/tools/python-3.14.9+20261021-linux-x64/bin/python3.14 \
+                /agent-src/.venv/bin/python
+              cat > /tmp/fixstamp.py <<'PY'
+              import json, pathlib
+              p = pathlib.Path('/agent-src/install-stamp.json')
+              s = json.loads(p.read_text())
+              s['pmRuntime'] = '/agent-src/pm-runtime'
+              p.write_text(json.dumps(s) + '\n')
+              PY
+              /agent-src/tools/python-3.14.9+20261021-linux-x64/bin/python3.14 /tmp/fixstamp.py
           volumeMounts:
             - name: agent-src
               mountPath: /agent-src
