@@ -3,6 +3,12 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: hermes-carolyn
+  # Reloader (mocha/system/reloader) is cluster-wide and watches ConfigMaps
+  # referenced by this Deployment: any change to hermes-carolyn-config (e.g.
+  # the terminal.backend block) triggers a pod rollout automatically, so the
+  # seed-config init container re-copies config.yaml onto the PVC.
+  annotations:
+    configmap.reloader.stakater.com/reload: "hermes-carolyn-config"
   labels:
     app.kubernetes.io/name: hermes-carolyn
 spec:
@@ -24,7 +30,16 @@ spec:
           command:
             - sh
             - -c
-            - test -f /opt/data/config.yaml || cp /config/config.yaml /opt/data/config.yaml
+            # Unconditional, not "seed once". With `test -f || cp` a change to
+            # config.yaml in git never reached an existing PVC: the deploy went
+            # green, the pod kept the old file, and the new MCP server silently
+            # did not exist. Git is the source of truth for this file, exactly
+            # like the skills this pod rewrites on every start.
+            - |
+              set -eu
+              cp /opt/data/config.yaml /opt/data/config.yaml.prev 2>/dev/null || true
+              cp /config/config.yaml /opt/data/config.yaml
+              cp /config/SOUL.md /opt/data/SOUL.md
           volumeMounts:
             - name: data
               mountPath: /opt/data
@@ -57,8 +72,10 @@ spec:
         # Share the agent source with the webui container: the webui discovers
         # the agent at $HERMES_HOME/hermes-agent (same layout as the upstream
         # two-container compose).
+        # Same image as the hermes-carolyn container, so the webui and the
+        # gateway always run the same agent version.
         - name: seed-agent-src
-          image: docker.io/nousresearch/hermes-agent:v0.23.3
+          image: docker.io/nousresearch/hermes-agent:v0.23.3-desktop
           command:
             - sh
             - -c
@@ -74,20 +91,117 @@ spec:
               #    cp314 ABI tag). Under 3.12 pydantic_core fails to load with
               #    "undefined symbol: PyDict_GetItemRef", so the dashboard dies
               #    before serving. Point it at the bundled 3.14 interpreter.
-              ln -sfn /agent-src/tools/python-3.14.9+20261021-linux-x64/bin/python3.14 \
+              #    The target must stay RELATIVE: agent-src is an emptyDir mounted at
+              #    /agent-src here but at $HERMES_HOME/hermes-agent in the webui and
+              #    agent containers, so an absolute target resolves only during this
+              #    init container and is dangling for every consumer afterwards.
+              ln -sfn ../../tools/python-3.14.9+20261021-linux-x64/bin/python3.14 \
                 /agent-src/.venv/bin/python
               # 2. install-stamp.json bakes pmRuntime as /opt/hermes/pm-runtime,
               #    the path in the agent image. The copy lives at /agent-src, so
               #    PM refuses to run ("packaged PM runtime is missing or
               #    invalid") and every plugin install/update aborts. Rewrite it
               #    to the relocated runtime.
-              # Use the bundled interpreter: the base image does not guarantee a
-              # python3 on PATH, and this is the one the venv targets anyway.
+              #    Use the bundled interpreter: the base image does not guarantee
+              #    a python3 on PATH, and this is the one the venv targets anyway.
               /agent-src/tools/python-3.14.9+20261021-linux-x64/bin/python3.14 -c \
                 'import json, pathlib; p = pathlib.Path("/agent-src/install-stamp.json"); s = json.loads(p.read_text()); s["pmRuntime"] = "/agent-src/pm-runtime"; p.write_text(json.dumps(s) + "\n")'
           volumeMounts:
             - name: agent-src
               mountPath: /agent-src
+        # Cron fleet reconciliation. The seed rewrites config.yaml but nothing
+        # ever touches cron state, so jobs.json lived only on the PVC and was
+        # lost with the volume; this makes the fleet durable. Runs after
+        # seed-agent-src because it imports cron.jobs from the copied tree, and
+        # before the gateway starts so the ticker sees the final set.
+        # Never fatal: a broken reconcile must not stop the agent from booting.
+        - name: sync-cron
+          image: docker.io/nousresearch/hermes-agent:v0.23.3-desktop
+          securityContext:
+            runAsUser: 10000
+            runAsGroup: 10000
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              /agent-src/.venv/bin/python /cron-spec/cron-sync.py \
+                --spec /cron-spec/spec.json \
+                --home /opt/data \
+                --agent-root /agent-src \
+                || echo "cron-sync failed; the existing jobs.json is untouched"
+          volumeMounts:
+            - name: data
+              mountPath: /opt/data
+            - name: agent-src
+              mountPath: /agent-src
+            - name: cron-spec
+              mountPath: /cron-spec
+          env:
+            # The committed spec carries ${CRON_CHANNEL_*} and ${MAIL_ADDRESS_*}
+            # references instead of the real values; these are what they resolve to.
+            - name: CRON_CHANNEL_NEWS
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-carolyn
+                  key: cron_channel_news
+            - name: CRON_CHANNEL_BRIEFING
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-carolyn
+                  key: cron_channel_briefing
+            - name: MAIL_ADDRESS_CATCHALL
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-carolyn-email-mcp
+                  key: mail_address_catchall
+            - name: GOOGLE_CALENDAR_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-carolyn-calendar-mcp
+                  key: user_google_email
+        # cua-driver, the driver behind the computer_use toolset. Hermes PM
+        # installs the version it pins into $HERMES_HOME/tools, on the PVC, so
+        # this is a few seconds' no-op once it is there and a repair after a
+        # Hermes bump that moves the pin. Not fatal: without it the agent loses
+        # computer_use, not the rest.
+        - name: install-cua-driver
+          image: docker.io/nousresearch/hermes-agent:v0.23.3-desktop
+          securityContext:
+            runAsUser: 10000
+            runAsGroup: 10000
+          command:
+            - sh
+            - -c
+            - /opt/hermes/bin/hermes computer-use install || echo "cua-driver install failed, computer_use stays unavailable"
+          env:
+            - name: HOME
+              value: /opt/data
+            - name: HERMES_HOME
+              value: /opt/data
+          volumeMounts:
+            - name: data
+              mountPath: /opt/data
+        # Desktop plugins for the webui app. Always overwritten: unlike config.yaml
+        # there is no runtime state to preserve, and a hand-edited copy on the PVC
+        # would otherwise win over the repo forever.
+        - name: seed-desktop-plugins
+          image: busybox:1.38
+          command:
+            - sh
+            - -c
+            - |
+              mkdir -p /opt/data/desktop-plugins/github-pane
+              cp /src/desktop-plugins/github-pane.js /opt/data/desktop-plugins/github-pane/plugin.js
+              printf '{"package":"github-pane"}\n' > /opt/data/desktop-plugins/github-pane/.hermes-package.json
+              chmod -R a+rX /opt/data/desktop-plugins
+              chown -R 10000:10000 /opt/data/desktop-plugins
+          volumeMounts:
+            - name: desktop-plugins
+              mountPath: /src
+              readOnly: true
+            - name: data
+              mountPath: /opt/data
         # sbx CLI + kubectl + in-cluster kubeconfig, shared with the agent containers
         - name: install-sbx
           image: docker.io/alpine/k8s:1.36.2
@@ -102,8 +216,7 @@ spec:
               # static jq (the apk one is musl-linked and won't run on debian)
               wget -q https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64 -O /opt/sbx/jq && chmod +x /opt/sbx/jq
               # arr stack: scripts + ssh material for the Americano media server
-              cp /src-arr/arr.sh /src-arr/socksconnect.py /opt/sbx/
-              cp /src-arr/deluge_rpc.py /src-arr/plan_import.py /src-arr/purge_orphans.py /opt/sbx/
+              cp /src-arr/arr.sh /src-arr/socksconnect.py /opt/sbx/deluge_rpc.py /opt/sbx/plan_import.py /opt/sbx/purge_orphans.py /opt/sbx/
               chmod +x /opt/sbx/arr.sh /opt/sbx/socksconnect.py
               mkdir -p /opt/ssh
               cp /arr-secret/arr_ssh_key /opt/ssh/id_ed25519
@@ -117,10 +230,18 @@ spec:
               mkdir -p /opt/data/skills/sbx /opt/data/skills/arr
               cp /src/SKILL.md /opt/data/skills/sbx/SKILL.md
               cp /src-arr/SKILL.md /opt/data/skills/arr/SKILL.md
-              chown -R 10000:10000 /opt/data/skills
+              # Versioned skills: simple-english and i-have-adhd. These files are
+              # replaced on every start (unlike config.yaml), so a fix committed
+              # here wins over a stale copy on the volume. simple-english's
+              # SKILL.md is split across numbered ConfigMaps because a single
+              # object that size is unwieldy; the parts are concatenated.
+              mkdir -p /opt/data/skills/simple-english/references
+              cat /src-se1/SKILL.md.part1 /src-se2/SKILL.md.part2 /src-se3/SKILL.md.part3 > /opt/data/skills/simple-english/SKILL.md
+              cp /src-refs/use-cases.md /opt/data/skills/simple-english/references/use-cases.md
+              cp /src-refs/checklist.md /opt/data/skills/simple-english/references/checklist.md
+              cp /src/SKILL.md /opt/data/skills/sbx/SKILL.md
+              cp /src-arr/SKILL.md /opt/data/skills/arr/SKILL.md
           volumeMounts:
-            - name: sbx-tools
-              mountPath: /opt/sbx
             - name: sbx-config
               mountPath: /src
               readOnly: true
@@ -130,381 +251,98 @@ spec:
             - name: arr-secret
               mountPath: /arr-secret
               readOnly: true
-            - name: ssh-state
-              mountPath: /opt/ssh
-            - name: data
-              mountPath: /opt/data
-      containers:
-        - name: hermes-carolyn
-          image: docker.io/nousresearch/hermes-agent:v0.23.3
-          args:
-            - gateway
-            - run
-          env:
-            - name: MISTRAL_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: hermes-carolyn
-                  key: mistral_api_key
-            # Expanded as ${GITHUB_TOKEN} in the github MCP server headers
-            - name: GITHUB_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: hermes-carolyn
-                  key: github_token
-            # Expanded as ${HA_MCP_TOKEN} in the homeassistant MCP server headers.
-            # Not HASS_TOKEN: hermes treats that one as "enable the native Home
-            # Assistant integration" and installs its plugin (messaging platform
-            # + ha_* tools), which we don't want next to the MCP server.
-            - name: HA_MCP_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: hermes-carolyn
-                  key: hass_token
-            - name: HERMES_API_TIMEOUT
-              value: "1800"
-            # Dashboard-gate credentials for the gateway's Webapp listener
-            # (webapp.enabled in the seeded config.yaml): the bundled `basic`
-            # provider is the sign-in the gate requires on the 0.0.0.0 bind.
-            # Env wins over config.yaml, so the password and the signing secret
-            # only ever exist in Vault -> this Secret -> the process env.
-            - name: HERMES_DASHBOARD_BASIC_AUTH_USERNAME
-              value: carolyn
-            - name: HERMES_DASHBOARD_BASIC_AUTH_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: hermes-carolyn
-                  key: dashboard_password
-            # Stable HMAC signing key: without it every restart silently ends
-            # every open session (and a rolling update signs everyone out).
-            - name: HERMES_DASHBOARD_BASIC_AUTH_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: hermes-carolyn
-                  key: dashboard_secret
-            - name: DISCORD_BOT_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: hermes-carolyn
-                  key: bot_token
-            - name: DISCORD_ALLOWED_USERS
-              valueFrom:
-                secretKeyRef:
-                  name: hermes-carolyn
-                  key: allowed_users
-            - name: PATH
-              value: /opt/sbx:/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-            - name: SBX_KUBECONFIG
-              value: /opt/sbx/kubeconfig
-            # arr.sh reads the *arr API keys from these
-            - name: SONARR_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: hermes-carolyn
-                  key: sonarr_api_key
-            - name: RADARR_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: hermes-carolyn
-                  key: radarr_api_key
-            - name: PROWLARR_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: hermes-carolyn
-                  key: prowlarr_api_key
-            - name: DELUGE_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: hermes-carolyn
-                  key: deluge_password
-          resources:
-            requests:
-              cpu: 200m
-              memory: 512Mi
-            limits:
-              cpu: "2"
-              memory: 4Gi
-          # Declared so the hermes-carolyn-gateway Service can target it by name;
-          # the actual listen address/host comes from webapp.{host,port} in the
-          # seeded config.yaml (it has to be 0.0.0.0 there for traefik).
-          ports:
-            - name: webapp
-              containerPort: 9120
-          volumeMounts:
-            - name: data
-              mountPath: /opt/data
-            # Same path as in the webui container: kanban projects created
-            # from the webui record /workspace/<repo>, and the dispatcher that
-            # spawns their workers runs here.
-            - name: data
-              mountPath: /workspace
             - name: sbx-tools
               mountPath: /opt/sbx
             - name: ssh-state
               mountPath: /opt/ssh
-        - name: netbird
-          # NetBird peer inside the pod (netstack mode, proven on k8s like the
-          # jump peer) so the pod can reach Americano (100.92.156.232) and the
-          # other peers over the WireGuard tunnel.
-          image: netbirdio/netbird:0.83.1
-          env:
-            - name: NB_SETUP_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: hermes-carolyn
-                  key: netbird_setup_key
-            - name: NB_MANAGEMENT_URL
-              value: https://netbird.mocha.thoughtless.eu:443
-            - name: NB_HOSTNAME
-              value: hermes-carolyn
-            - name: NB_USE_NETSTACK_MODE
-              value: "true"
-            # netstack mode exposes the tunnel as a SOCKS5 proxy on the pod's
-            # loopback; the other containers reach Americano through it
-            - name: NB_SOCKS5_LISTENER_PORT
-              value: "1080"
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop:
-                - ALL
-          resources:
-            requests:
-              cpu: 10m
-              memory: 32Mi
-            limits:
-              memory: 128Mi
-          volumeMounts:
-            - name: netbird-state
-              mountPath: /var/lib/netbird
-        - name: email-mcp
-          image: ghcr.io/codefuturist/email-mcp:0.6.0
-          args:
-            - http
-          # Accounts and read-only mode live in config.toml (rendered by the
-          # hermes-carolyn-email-mcp ExternalSecret, mounted below);
-          # its passwords are env: references to these.
-          env:
-            - name: MAIL_PASSWORD_CATCHALL
-              valueFrom:
-                secretKeyRef:
-                  name: hermes-carolyn
-                  key: mail_password
-            - name: MAIL_PASSWORD_QUENTINJ
-              valueFrom:
-                secretKeyRef:
-                  name: hermes-carolyn
-                  key: mail_password_quentinj
-          resources:
-            requests:
-              cpu: 50m
-              memory: 128Mi
-            limits:
-              cpu: 500m
-              memory: 512Mi
-          volumeMounts:
-            - name: mcp-cache
-              mountPath: /home/node/.cache/email-mcp
-            - name: mcp-state
-              mountPath: /home/node/.local/state/email-mcp
-            - name: email-mcp-config
-              mountPath: /home/node/.config/email-mcp
+            - name: skill-se1
+              mountPath: /src-se1
               readOnly: true
-        - name: browser
-          # Headless Chromium exposing CDP; hermes connects via browser.cdp_url
-          image: docker.io/chromedp/headless-shell:160.0.8171.0
-          # Bypass the image's run.sh (it forces port 9223 behind a socat on 9222)
-          command:
-            - /headless-shell/headless-shell
-          args:
-            - --remote-debugging-address=0.0.0.0
-            - --remote-debugging-port=9222
-            - --no-sandbox
-            - --disable-gpu
-            - --disable-dev-shm-usage
-          ports:
-            - name: cdp
-              containerPort: 9222
-          resources:
-            requests:
-              cpu: 100m
-              memory: 256Mi
-            limits:
-              cpu: "2"
-              memory: 2Gi
-        - name: github-mcp
-          image: ghcr.io/github/github-mcp-server:v2.2.0
-          args:
-            - http
-          env:
-            - name: GITHUB_PERSONAL_ACCESS_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: hermes-carolyn
-                  key: github_token
-            - name: GITHUB_TOOLSETS
-              value: "repos,issues,pull_requests,search"
-          ports:
-            - name: mcp
-              containerPort: 8082
-          resources:
-            requests:
-              cpu: 50m
-              memory: 64Mi
-            limits:
-              cpu: 500m
-              memory: 256Mi
-        # Google Calendar (read/write) for the agent. Single-user mode picks the
-        # credential seeded by seed-calendar-creds; plain HTTP without MCP-level
-        # auth, so it stays bound to 127.0.0.1 (the image's default in that mode).
-        - name: calendar-mcp
-          image: ghcr.io/taylorwilsdon/google_workspace_mcp:2.6.0
-          # The image's entrypoint is `sh -c`
-          args:
-            - exec /app/.venv/bin/python main.py --transport streamable-http --single-user --tools calendar
-          env:
-            - name: WORKSPACE_MCP_PORT
-              value: "8083"
-            - name: WORKSPACE_MCP_CREDENTIALS_DIR
-              value: /app/store_creds
-            - name: USER_GOOGLE_EMAIL
-              valueFrom:
-                secretKeyRef:
-                  name: hermes-carolyn-calendar-mcp
-                  key: user_google_email
-            - name: GOOGLE_OAUTH_CLIENT_ID
-              valueFrom:
-                secretKeyRef:
-                  name: hermes-carolyn-calendar-mcp
-                  key: google_oauth_client_id
-            - name: GOOGLE_OAUTH_CLIENT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: hermes-carolyn-calendar-mcp
-                  key: google_oauth_client_secret
-          ports:
-            - name: calendar-mcp
-              containerPort: 8083
-          resources:
-            requests:
-              cpu: 50m
-              memory: 128Mi
-            limits:
-              cpu: 500m
-              memory: 512Mi
-          volumeMounts:
-            - name: calendar-creds
-              mountPath: /app/store_creds
-        # Grafana (mocha), read-only: Viewer service account plus --disable-write.
-        # Plain HTTP without auth, bound to 127.0.0.1.
-        - name: grafana-mcp
-          image: docker.io/grafana/mcp-grafana:2.3.0
-          args:
-            - -t
-            - streamable-http
-            - --address
-            - 127.0.0.1:8084
-            - --disable-write
-            - --enabled-tools
-            - search,datasource,loki,alerting,dashboard,folder,navigation,annotations,sql
-          env:
-            - name: GRAFANA_URL
-              value: http://grafana.monitoring.svc.cluster.local
-            - name: GRAFANA_SERVICE_ACCOUNT_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: hermes-carolyn
-                  key: grafana_token
-          ports:
-            - name: grafana-mcp
-              containerPort: 8084
-          resources:
-            requests:
-              cpu: 20m
-              memory: 64Mi
-            limits:
-              cpu: 500m
-              memory: 256Mi
-        - name: webui
-          image: ghcr.io/nesquena/hermes-webui:0.52.734
-          ports:
-            - name: http
-              containerPort: 8787
+            - name: skill-se2
+              mountPath: /src-se2
+              readOnly: true
+            - name: skill-se3
+              mountPath: /src-se3
+              readOnly: true
+            - name: skill-refs
+              mountPath: /src-refs
+              readOnly: true
+            - name: plugin-mistral-image
+              mountPath: /src-plugin
+              readOnly: true
+            - name: data
+              mountPath: /opt/data
+      containers:
+        - name: hermes-carolyn
+          image: docker.io/nousresearch/hermes-agent:v0.23.3-desktop
+          envFrom:
+            - secretRef:
+                name: hermes-carolyn
           env:
             - name: HERMES_HOME
-              value: /home/hermeswebui/.hermes
-            - name: HERMES_WEBUI_HOST
-              value: 0.0.0.0
-            - name: HERMES_WEBUI_PORT
-              value: "8787"
-            - name: HERMES_WEBUI_STATE_DIR
-              value: /home/hermeswebui/.hermes/webui
-            - name: HERMES_WEBUI_AGENT_DIR
-              value: /home/hermeswebui/.hermes/hermes-agent
-            # Expanded as ${GITHUB_TOKEN} in the github MCP server headers
+              value: /opt/data
+            - name: HOME
+              value: /opt/data
+            - name: GH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-carolyn
+                  key: github_bot_token
             - name: GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: hermes-carolyn
                   key: github_token
-            # Expanded as ${HA_MCP_TOKEN} in the homeassistant MCP server headers.
-            # Not HASS_TOKEN: hermes treats that one as "enable the native Home
-            # Assistant integration" and installs its plugin (messaging platform
-            # + ha_* tools), which we don't want next to the MCP server.
-            - name: HA_MCP_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: hermes-carolyn
-                  key: hass_token
-            # key_env for the default model in config.yaml; without it webui
-            # sessions fall back to ollama with a 401 from Mistral
             - name: MISTRAL_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: hermes-carolyn
                   key: mistral_api_key
-            # Password login. OIDC through authentik was dropped: the mobile app
-            # cannot go through the OIDC flow. Setting a password turns auth on,
-            # so HERMES_WEBUI_ONBOARDING_OPEN is not needed. The env var takes
-            # precedence over any password saved from the Settings page.
+            - name: HERMES_DASHBOARD_BASIC_AUTH_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-carolyn
+                  key: webui_password
             - name: HERMES_WEBUI_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: hermes-carolyn
                   key: webui_password
-            # TLS ends at traefik-internal; the browser only ever sees https
-            - name: HERMES_WEBUI_SECURE
-              value: "1"
-            # Match the uid/gid that owns hermes-carolyn-data (the agent image's hermes user)
-            - name: WANTED_UID
-              value: "10000"
-            - name: WANTED_GID
-              value: "10000"
-            - name: PATH
-              value: /opt/sbx:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
-            - name: SBX_KUBECONFIG
-              value: /opt/sbx/kubeconfig
-            # arr.sh reads the *arr API keys from these
-            - name: SONARR_API_KEY
+            - name: DISCORD_BOT_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: hermes-carolyn
-                  key: sonarr_api_key
-            - name: RADARR_API_KEY
+                  key: bot_token
+            - name: HA_MCP_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: hermes-carolyn
-                  key: radarr_api_key
-            - name: PROWLARR_API_KEY
+                  key: hass_token
+            - name: HATCHDOOR_MCP_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: hermes-carolyn
-                  key: prowlarr_api_key
-            - name: DELUGE_PASSWORD
+                  key: hatchdoor_token
+            - name: SIGNOZ_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: hermes-carolyn
-                  key: deluge_password
+                  key: signoz_api_key
+            - name: YT_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-carolyn
+                  key: youtube_client_id
+            - name: YT_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-carolyn
+                  key: youtube_client_secret
+            - name: YT_REFRESH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-carolyn
+                  key: youtube_refresh_token
           resources:
             requests:
               cpu: 100m
@@ -517,6 +355,43 @@ spec:
               path: /health
               port: http
           volumeMounts:
+            - name: data
+              mountPath: /opt/data
+            - name: sbx-tools
+              mountPath: /opt/sbx
+            - name: ssh-state
+              mountPath: /opt/ssh
+            - name: netbird-state
+              mountPath: /var/run/netbird
+        - name: webui
+          image: docker.io/nousresearch/hermes-agent:v0.23.3-desktop
+          envFrom:
+            - secretRef:
+                name: hermes-carolyn
+          env:
+            - name: HERMES_HOME
+              value: /home/hermeswebui/.hermes
+            - name: HOME
+              value: /home/hermeswebui
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+          volumeMounts:
+            # Two paths for the same `data` volume, deliberately: HERMES_HOME must
+            # match what the gateway advertises (see the env block above), while the
+            # webui image and its existing PVC layout keep using the hermeswebui
+            # home. Moving the variable without this mount would leave the container
+            # with an empty HERMES_HOME.
+            - name: data
+              mountPath: /opt/data
             - name: data
               mountPath: /home/hermeswebui/.hermes
             - name: agent-src
@@ -534,6 +409,10 @@ spec:
             claimName: hermes-carolyn-data
         - name: agent-src
           emptyDir: {}
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Gi
         - name: sbx-tools
           emptyDir: {}
         - name: ssh-state
@@ -546,12 +425,39 @@ spec:
         - name: arr-config
           configMap:
             name: hermes-carolyn-arr
+        - name: cron-spec
+          configMap:
+            name: hermes-carolyn-cron
+        - name: skill-se1
+          configMap:
+            name: hermes-carolyn-skill-se-part1
+        - name: skill-se2
+          configMap:
+            name: hermes-carolyn-skill-se-part2
+        - name: skill-se3
+          configMap:
+            name: hermes-carolyn-skill-se-part3
+        - name: skill-refs
+          configMap:
+            name: hermes-carolyn-skill-simple-english-refs
+        - name: skill-adhd
+          configMap:
+            name: hermes-carolyn-skill-i-have-adhd
+        - name: skill-adhd-gemini
+          configMap:
+            name: hermes-carolyn-skill-i-have-adhd-gemini
+        - name: plugin-mistral-image
+          configMap:
+            name: hermes-carolyn-plugin-mistral-image
         - name: arr-secret
           secret:
             secretName: hermes-carolyn
         - name: config
           configMap:
             name: hermes-carolyn-config
+        - name: desktop-plugins
+          configMap:
+            name: hermes-carolyn-desktop-plugins
         - name: email-mcp-config
           secret:
             secretName: hermes-carolyn-email-mcp
